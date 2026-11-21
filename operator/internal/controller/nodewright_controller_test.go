@@ -8016,6 +8016,74 @@ var _ = Describe("HandleFinalizer and the runtime-required taint", func() {
 		Expect(node.Annotations).ToNot(HaveKey(v1alpha1.RuntimeRequiredCordonAnnotation))
 	})
 
+
+	It("does not cordon for a released NodeWright when the remaining one completes", func() {
+		releasedGate := deleting(newNodeWright("released-gate", true))
+		releasedGate.Spec.RuntimeRequiredCordonAfter = true
+		releasedGate.Finalizers = append(releasedGate.Finalizers, "example.com/foreign")
+		r, c := newReconciler(interceptor.Funcs{}, releasedGate, newNodeWright("live-gate", true), newNode("released-gate"))
+
+		// The foreign finalizer keeps the deleted NodeWright visible after our cleanup.
+		handled, err := finalize(r, c, "released-gate")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(handled).To(BeTrue())
+		stored := &v1alpha1.NodeWright{}
+		Expect(c.Get(ctx, types.NamespacedName{Name: "released-gate"}, stored)).To(Succeed())
+		Expect(stored.Finalizers).To(ConsistOf("example.com/foreign"))
+		Expect(liveNode(c).Spec.Taints).To(ContainElement(configuredTaint))
+
+		// The live NodeWright completes in the next pass. Only its cordonAfter setting counts.
+		nodeWrights := &v1alpha1.NodeWrightList{}
+		Expect(c.List(ctx, nodeWrights)).To(Succeed())
+		nodes := &corev1.NodeList{}
+		Expect(c.List(ctx, nodes)).To(Succeed())
+		state, err := BuildState(nodeWrights, nodes, &v1alpha1.DeploymentPolicyList{})
+		Expect(err).ToNot(HaveOccurred())
+		idx := slices.IndexFunc(state.skyhooks, func(s SkyhookNodes) bool {
+			return s.GetSkyhook().Name == "live-gate"
+		})
+		Expect(idx).ToNot(Equal(-1))
+		_, live := state.skyhooks[idx].GetNode(nodeName)
+		Expect(live).ToNot(BeNil())
+		Expect(live.Upsert(pkg.PackageRef, pkg.Image, v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")).To(Succeed())
+
+		Expect(r.HandleRuntimeRequired(ctx, state, nodes, nil)).To(Succeed())
+		node := liveNode(c)
+		Expect(node.Spec.Taints).To(ConsistOf(unrelatedTaint))
+		Expect(node.Spec.Unschedulable).To(BeFalse())
+		Expect(node.Annotations).ToNot(HaveKey(v1alpha1.RuntimeRequiredCordonAnnotation))
+	})
+
+	It("does not re-taint after cleanup when a foreign finalizer retains the deleted NodeWright", func() {
+		gate := deleting(newNodeWright("gate", true))
+		gate.Spec.AutoTaintNewNodes = true
+		gate.Finalizers = append(gate.Finalizers, "example.com/foreign")
+		r, c := newReconciler(interceptor.Funcs{}, gate, newNode("gate"))
+
+		handled, err := finalize(r, c, "gate")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(handled).To(BeTrue())
+		stored := &v1alpha1.NodeWright{}
+		Expect(c.Get(ctx, types.NamespacedName{Name: "gate"}, stored)).To(Succeed())
+		Expect(stored.Finalizers).To(ConsistOf("example.com/foreign"))
+		Expect(liveNode(c).Spec.Taints).To(ConsistOf(unrelatedTaint))
+
+		// After metadata cleanup the node looks new again; the next pass must ignore
+		// the terminating NodeWright instead of applying the NoSchedule taint again.
+		nodeWrights := &v1alpha1.NodeWrightList{}
+		Expect(c.List(ctx, nodeWrights)).To(Succeed())
+		nodes := &corev1.NodeList{}
+		Expect(c.List(ctx, nodes)).To(Succeed())
+		state, err := BuildState(nodeWrights, nodes, &v1alpha1.DeploymentPolicyList{})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(state.getAutoTaintNodes(r.opts.GetRuntimeRequiredTaints())).To(BeEmpty())
+		changed, untainted, err := r.HandleAutoTaint(ctx, state)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(changed).To(BeFalse())
+		Expect(untainted).To(BeEmpty())
+		Expect(liveNode(c).Spec.Taints).To(ConsistOf(unrelatedTaint))
+	})
+
 	It("keeps the taints while another runtime-required NodeWright selects the node", func() {
 		r, c := newReconciler(interceptor.Funcs{},
 			deleting(newNodeWright("gate", true)), newNodeWright("other-gate", true), newNode("gate", "other-gate"))
