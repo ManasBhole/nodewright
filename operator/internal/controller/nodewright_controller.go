@@ -2985,6 +2985,8 @@ func (r *SkyhookReconciler) HandleFinalizer(ctx context.Context, skyhook Skyhook
 
 			// Phase 3: All enabled packages uninstalled (or none exist). Cleanup.
 			errs := make([]error, 0)
+			// Metadata patches can refresh the node objects. Keep the identities used for selection.
+			gatedNodes := nodesGatedOnlyBy(skyhook, clusterState)
 
 			// zero out all the metrics related to this skyhook both skyhook and packages
 			zeroOutSkyhookMetrics(skyhook)
@@ -3009,9 +3011,9 @@ func (r *SkyhookReconciler) HandleFinalizer(ctx context.Context, skyhook Skyhook
 			// The completion path only considers nodes some runtime-required NodeWright still
 			// selects, so a node this one leaves gated would otherwise stay NoSchedule for good.
 			// No cordon follows: runtimeRequiredCordonAfter hands off a node that completed.
-			for _, nodeName := range nodesGatedOnlyBy(skyhook, clusterState) {
-				if err := r.removeRuntimeRequiredTaints(ctx, nodeName, r.opts.GetRuntimeRequiredTaints(), false); err != nil {
-					errs = append(errs, fmt.Errorf("error removing runtime-required taints from node [%s] in finalizer: %w", nodeName, err))
+			for _, node := range gatedNodes {
+				if err := r.removeRuntimeRequiredTaints(ctx, node.Name, node.UID, r.opts.GetRuntimeRequiredTaints(), false); err != nil {
+					errs = append(errs, fmt.Errorf("error removing runtime-required taints from node [%s] in finalizer: %w", node.Name, err))
 				}
 			}
 
@@ -4363,7 +4365,7 @@ func (r *SkyhookReconciler) HandleRuntimeRequired(ctx context.Context, clusterSt
 	errs := make([]error, 0)
 	for _, node := range to_remove {
 		cordonAfter := runtimeRequiredCordonAfterEnabled(gating[node.UID])
-		if err := r.removeRuntimeRequiredTaints(ctx, node.Name, taints_to_remove, cordonAfter); err != nil {
+		if err := r.removeRuntimeRequiredTaints(ctx, node.Name, node.UID, taints_to_remove, cordonAfter); err != nil {
 			errs = append(errs, fmt.Errorf("removing runtime-required taints from node %s: %w", node.Name, err))
 		}
 	}
@@ -4405,7 +4407,7 @@ func (r *SkyhookReconciler) removeStaleRuntimeRequiredCordonAnnotation(ctx conte
 // retry. The eligibility decision comes from a whole-cluster snapshot whose Node copy may
 // already be stale, so patching that copy under an optimistic lock would repeatedly conflict
 // instead of preserving concurrent taints and converging during this reconcile pass.
-func (r *SkyhookReconciler) removeRuntimeRequiredTaints(ctx context.Context, nodeName string, taintsToRemove []corev1.Taint, cordonAfter bool) error {
+func (r *SkyhookReconciler) removeRuntimeRequiredTaints(ctx context.Context, nodeName string, nodeUID types.UID, taintsToRemove []corev1.Taint, cordonAfter bool) error {
 	attempt := 0
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		node, err := readForPatch(ctx, func() (*corev1.Node, error) { return r.dal.GetNode(ctx, nodeName) },
@@ -4414,7 +4416,7 @@ func (r *SkyhookReconciler) removeRuntimeRequiredTaints(ctx context.Context, nod
 		if err != nil {
 			return fmt.Errorf("re-reading node before patching: %w", err)
 		}
-		if node == nil {
+		if node == nil || node.UID != nodeUID {
 			return nil
 		}
 
@@ -4487,27 +4489,27 @@ func releasedOnDeletion(skyhook SkyhookNodes) bool {
 	return !nw.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(nw.NodeWright, SkyhookFinalizer)
 }
 
-// nodesGatedOnlyBy names the nodes a runtime-required NodeWright selects that no other
+// nodesGatedOnlyBy identifies the nodes a runtime-required NodeWright selects that no other
 // runtime-required NodeWright selects. It returns none for a NodeWright that is not runtime-required.
-func nodesGatedOnlyBy(skyhook SkyhookNodes, clusterState *clusterState) []string {
+func nodesGatedOnlyBy(skyhook SkyhookNodes, clusterState *clusterState) []corev1.ObjectReference {
 	if !skyhook.GetSkyhook().Spec.RuntimeRequired {
 		return nil
 	}
-	names := make([]string, 0)
+	nodes := make([]corev1.ObjectReference, 0)
 	for _, node := range skyhook.GetNodes() {
-		name := node.GetNode().Name
+		selectedNode := node.GetNode()
 		shared := slices.ContainsFunc(clusterState.skyhooks, func(other SkyhookNodes) bool {
 			if other.GetSkyhook().Name == skyhook.GetSkyhook().Name || !other.GetSkyhook().Spec.RuntimeRequired || releasedOnDeletion(other) {
 				return false
 			}
-			_, selected := other.GetNode(name)
+			_, selected := other.GetNode(selectedNode.Name)
 			return selected != nil
 		})
 		if !shared {
-			names = append(names, name)
+			nodes = append(nodes, corev1.ObjectReference{Name: selectedNode.Name, UID: selectedNode.UID})
 		}
 	}
-	return names
+	return nodes
 }
 
 // withoutReleased leaves the NodeWrights released on deletion out of each node's list, and drops a
