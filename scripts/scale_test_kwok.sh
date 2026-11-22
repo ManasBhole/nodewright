@@ -82,6 +82,15 @@ if ! [[ "${PODS_PER_NODE}" =~ ^(0|[1-9][0-9]*)$ && "${SETTLE}" =~ ^(0|[1-9][0-9]
   echo "--pods-per-node and --settle must be nonnegative integers and --timeout must be a positive integer" >&2
   usage 1
 fi
+# Deployment replicas are int32. Check before creating resources or multiplying the inputs.
+max_replicas=2147483647
+if [[ "${PODS_PER_NODE}" != 0 ]] &&
+   (( ${#NODES} > ${#max_replicas} || ${#PODS_PER_NODE} > ${#max_replicas} ||
+      PODS_PER_NODE > max_replicas / NODES )); then
+  echo "--nodes times --pods-per-node exceeds the Deployment limit of ${max_replicas} replicas" >&2
+  exit 1
+fi
+workload_pods=$((NODES * PODS_PER_NODE))
 if [[ -n "${PID}" && ! "${PID}" =~ ^[1-9][0-9]*$ ]]; then
   echo "--pid must identify one process by its numeric PID" >&2
   usage 1
@@ -171,11 +180,12 @@ nodes_ready() {
 load_ready() {
   local ready
   ready="$(get deployment scale-test-load -n "${RUN_NAME}" -o jsonpath='{.status.readyReplicas}')" || return 1
-  [[ "${ready:-0}" == "$((NODES * PODS_PER_NODE))" ]]
+  [[ "${ready:-0}" == "${workload_pods}" ]]
 }
 
 create_nodes() {
-  local i
+  # Leave the original 250 pod slots available for package Jobs and cluster DaemonSets.
+  local i pod_capacity=$((PODS_PER_NODE + 250))
   for ((i = 1; i <= NODES; i++)); do
     cat <<EOF
 ---
@@ -197,8 +207,8 @@ spec:
     value: fake
     effect: NoSchedule
 status:
-  allocatable: {cpu: "64", memory: 512Gi, pods: "250"}
-  capacity: {cpu: "64", memory: 512Gi, pods: "250"}
+  allocatable: {cpu: "64", memory: 512Gi, pods: "${pod_capacity}"}
+  capacity: {cpu: "64", memory: 512Gi, pods: "${pod_capacity}"}
 EOF
   done | kubectl create -f - >/dev/null
 }
@@ -211,7 +221,7 @@ metadata:
   name: scale-test-load
   namespace: ${RUN_NAME}
 spec:
-  replicas: $((NODES * PODS_PER_NODE))
+  replicas: ${workload_pods}
   selector:
     matchLabels: {app: scale-test-load}
   template:
@@ -269,11 +279,11 @@ if (( KEEP == 0 )); then
   trap cleanup EXIT
 fi
 
-log "${RUN_NAME}: creating ${NODES} nodes and $((NODES * PODS_PER_NODE)) workload pods"
+log "${RUN_NAME}: creating ${NODES} nodes and ${workload_pods} workload pods"
 create_nodes
 wait_for "${NODES} ready nodes" nodes_ready
 create_load
-wait_for "$((NODES * PODS_PER_NODE)) ready workload pods" load_ready
+wait_for "${workload_pods} ready workload pods" load_ready
 sleep "${SETTLE}"
 record_collected idle
 
