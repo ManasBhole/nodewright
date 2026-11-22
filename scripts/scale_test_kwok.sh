@@ -22,11 +22,7 @@
 
 set -euo pipefail
 
-NODE_PREFIX="scale-kwok-node-"
 NODE_LABEL_KEY="nodewright.nvidia.com/scale-test"
-NODE_LABEL_VALUE="kwok"
-LOAD_NAMESPACE="scale-test-load"
-NODEWRIGHT_NAME="scale-test-kwok"
 KWOK_TAINT_KEY="kwok.x-k8s.io/node"
 
 NODES=""
@@ -46,7 +42,7 @@ Usage: $0 --nodes N [options]
 
 Options:
   --nodes N          Number of kwok fake nodes (required)
-  --pods-per-node K  Workload pods per node, besides DaemonSet pods (default: ${PODS_PER_NODE})
+  --pods-per-node K  Create N times K workload pods across the fake nodes (default: ${PODS_PER_NODE})
   --packages P       Packages in the NodeWright (default: ${PACKAGES})
   --namespace NS     Operator namespace, where the package Jobs run (default: ${NAMESPACE})
   --pprof-url URL    The operator's pprof endpoint (default: ${PPROF_URL})
@@ -81,6 +77,15 @@ if ! [[ "${NODES}" =~ ^[1-9][0-9]*$ ]]; then
   echo "--nodes must be a positive integer" >&2
   usage 1
 fi
+if ! [[ "${PODS_PER_NODE}" =~ ^(0|[1-9][0-9]*)$ && "${SETTLE}" =~ ^(0|[1-9][0-9]*)$ &&
+        "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--pods-per-node and --settle must be nonnegative integers and --timeout must be a positive integer" >&2
+  usage 1
+fi
+if [[ -n "${PID}" && ! "${PID}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--pid must identify one process by its numeric PID" >&2
+  usage 1
+fi
 LETTERS="abcdefghijklmnopqrstuvwxyz"
 if ! [[ "${PACKAGES}" =~ ^[1-9][0-9]*$ ]] || (( PACKAGES > ${#LETTERS} )); then
   echo "--packages must be between 1 and ${#LETTERS}" >&2
@@ -89,11 +94,16 @@ fi
 for tool in kubectl curl jq; do
   command -v "${tool}" >/dev/null || { echo "${tool} is required" >&2; exit 1; }
 done
-if ! kubectl get stages.kwok.x-k8s.io pod-complete >/dev/null 2>&1; then
+request_timeout=$(( TIMEOUT < 30 ? TIMEOUT : 30 ))
+curl_args=(-fsS --connect-timeout 5 --max-time "${request_timeout}")
+get() {
+  kubectl --request-timeout="${request_timeout}s" get "$@"
+}
+if ! get stages.kwok.x-k8s.io pod-complete >/dev/null; then
   echo "kwok with its fast stages is not installed in this cluster; see the prerequisites at the top of $0" >&2
   exit 1
 fi
-if ! curl -fsS -o /dev/null "${PPROF_URL}/debug/pprof/"; then
+if ! curl "${curl_args[@]}" -o /dev/null "${PPROF_URL}/debug/pprof/"; then
   echo "no pprof endpoint at ${PPROF_URL}; start the operator with PPROF_PORT set" >&2
   exit 1
 fi
@@ -105,25 +115,37 @@ log() {
 # memstats prints HeapAlloc, HeapInuse and Sys in MiB, comma-separated. With gc=1 the runtime
 # collects first, so HeapAlloc is the live heap; with gc=0 it is the heap at this instant.
 memstats() {
-  curl -fsS "${PPROF_URL}/debug/pprof/heap?debug=1&gc=$1" |
-    awk '/^# HeapAlloc = /{a=$4} /^# HeapInuse = /{i=$4} /^# Sys = /{s=$4}
-         END{printf "%.0f,%.0f,%.0f", a/1048576, i/1048576, s/1048576}'
+  curl "${curl_args[@]}" "${PPROF_URL}/debug/pprof/heap?debug=1&gc=$1" |
+    awk '/^# HeapAlloc = [0-9]+$/ {a=$4}
+         /^# HeapInuse = [0-9]+$/ {i=$4}
+         /^# Sys = [0-9]+$/       {s=$4}
+         END {
+           if (!length(a) || !length(i) || !length(s)) exit 1
+           printf "%.0f,%.0f,%.0f", a/1048576, i/1048576, s/1048576
+         }'
 }
 
 rss_mib() {
   if [[ -n "${PID}" ]]; then
-    echo $(( $(ps -o rss= -p "${PID}") / 1024 ))
+    ps -o rss= -p "${PID}" | awk 'NF {print int($1/1024)}'
   fi
 }
 
 record() {
   local phase="$1" stats="$2" rss="$3" pods jobs
-  pods="$(kubectl get pods -A --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-  jobs="$(kubectl get jobs -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  pods="$(get pods -A --no-headers | wc -l | tr -d ' ')"
+  jobs="$(get jobs -n "${NAMESPACE}" --no-headers | wc -l | tr -d ' ')"
   if [[ ! -s "${OUTPUT}" ]]; then
     echo "nodes,pods_per_node,packages,phase,heap_alloc_mib,heap_inuse_mib,sys_mib,rss_mib,pods,jobs,timestamp" >> "${OUTPUT}"
   fi
   echo "${NODES},${PODS_PER_NODE},${PACKAGES},${phase},${stats},${rss},${pods},${jobs},$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${OUTPUT}"
+}
+
+record_collected() {
+  local phase="$1" stats rss
+  stats="$(memstats 1)" || { log "could not read a complete heap profile for ${phase}"; exit 1; }
+  rss="$(rss_mib)"
+  record "${phase}" "${stats}" "${rss}"
 }
 
 # wait_for runs "$@" every 5s until it succeeds or TIMEOUT passes.
@@ -140,16 +162,16 @@ wait_for() {
 }
 
 nodes_ready() {
-  [[ "$(kubectl get nodes -l "${NODE_LABEL_KEY}=${NODE_LABEL_VALUE}" -o json |
-    jq '[.items[] | select(.status.conditions[]? | .type == "Ready" and .status == "True")] | length')" -ge "${NODES}" ]]
+  local ready
+  ready="$(get nodes -l "${NODE_LABEL_KEY}=${RUN_NAME}" -o json |
+    jq '[.items[] | select(.status.conditions[]? | .type == "Ready" and .status == "True")] | length')" || return 1
+  [[ "${ready}" == "${NODES}" ]]
 }
 
 load_ready() {
-  [[ "$(kubectl -n "${LOAD_NAMESPACE}" get deployment scale-test-load -o jsonpath='{.status.readyReplicas}')" == "$((NODES * PODS_PER_NODE))" ]]
-}
-
-nodewright_complete() {
-  [[ "$(kubectl get nodewright "${NODEWRIGHT_NAME}" -o jsonpath='{.status.status}{" "}{.status.completeNodes}')" == "complete ${NODES}/${NODES}" ]]
+  local ready
+  ready="$(get deployment scale-test-load -n "${RUN_NAME}" -o jsonpath='{.status.readyReplicas}')" || return 1
+  [[ "${ready:-0}" == "$((NODES * PODS_PER_NODE))" ]]
 }
 
 create_nodes() {
@@ -160,15 +182,15 @@ create_nodes() {
 apiVersion: v1
 kind: Node
 metadata:
-  name: ${NODE_PREFIX}${i}
+  name: ${RUN_NAME}-${i}
   annotations:
     node.alpha.kubernetes.io/ttl: "0"
     kwok.x-k8s.io/node: fake
   labels:
     kubernetes.io/arch: amd64
     kubernetes.io/os: linux
-    kubernetes.io/hostname: ${NODE_PREFIX}${i}
-    ${NODE_LABEL_KEY}: ${NODE_LABEL_VALUE}
+    kubernetes.io/hostname: ${RUN_NAME}-${i}
+    ${NODE_LABEL_KEY}: ${RUN_NAME}
 spec:
   taints:
   - key: ${KWOK_TAINT_KEY}
@@ -178,17 +200,16 @@ status:
   allocatable: {cpu: "64", memory: 512Gi, pods: "250"}
   capacity: {cpu: "64", memory: 512Gi, pods: "250"}
 EOF
-  done | kubectl apply -f - >/dev/null
+  done | kubectl create -f - >/dev/null
 }
 
 create_load() {
-  kubectl create namespace "${LOAD_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  kubectl apply -f - >/dev/null <<EOF
+  kubectl create -f - >/dev/null <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: scale-test-load
-  namespace: ${LOAD_NAMESPACE}
+  namespace: ${RUN_NAME}
 spec:
   replicas: $((NODES * PODS_PER_NODE))
   selector:
@@ -197,7 +218,7 @@ spec:
     metadata:
       labels: {app: scale-test-load}
     spec:
-      nodeSelector: {${NODE_LABEL_KEY}: ${NODE_LABEL_VALUE}}
+      nodeSelector: {${NODE_LABEL_KEY}: ${RUN_NAME}}
       tolerations:
       - {key: ${KWOK_TAINT_KEY}, operator: Exists, effect: NoSchedule}
       containers:
@@ -212,11 +233,11 @@ create_nodewright() {
 apiVersion: nodewright.nvidia.com/v1alpha1
 kind: NodeWright
 metadata:
-  name: ${NODEWRIGHT_NAME}
+  name: ${RUN_NAME}
 spec:
   nodeSelectors:
     matchLabels:
-      ${NODE_LABEL_KEY}: ${NODE_LABEL_VALUE}
+      ${NODE_LABEL_KEY}: ${RUN_NAME}
   additionalTolerations:
   - {key: ${KWOK_TAINT_KEY}, operator: Equal, value: fake, effect: NoSchedule}
   packages:
@@ -225,38 +246,48 @@ EOF
     for ((i = 0; i < PACKAGES; i++)); do
       printf '    pkg-%s:\n      version: "1.0.0"\n      image: ghcr.io/nvidia/skyhook/agentless\n' "${LETTERS:i:1}"
     done
-  } | kubectl apply -f - >/dev/null
+  } | kubectl create -f - >/dev/null
 }
 
 cleanup() {
-  log "deleting the NodeWright, its Jobs, the workload and the nodes"
-  kubectl delete nodewright "${NODEWRIGHT_NAME}" --ignore-not-found --timeout=300s >/dev/null || true
-  kubectl -n "${NAMESPACE}" delete jobs -l "nodewright.nvidia.com/name=${NODEWRIGHT_NAME}" --ignore-not-found >/dev/null || true
-  kubectl delete namespace "${LOAD_NAMESPACE}" --ignore-not-found --timeout=600s >/dev/null || true
-  kubectl delete nodes -l "${NODE_LABEL_KEY}=${NODE_LABEL_VALUE}" --ignore-not-found >/dev/null || true
+  log "deleting the NodeWright, Jobs, workload and nodes for ${RUN_NAME}"
+  kubectl delete nodewright "${RUN_NAME}" --ignore-not-found --timeout=300s >/dev/null || true
+  kubectl -n "${NAMESPACE}" delete jobs -l "nodewright.nvidia.com/name=${RUN_NAME}" --ignore-not-found --timeout=300s >/dev/null || true
+  kubectl delete namespace "${RUN_NAME}" --ignore-not-found --timeout=600s >/dev/null || true
+  kubectl delete nodes -l "${NODE_LABEL_KEY}=${RUN_NAME}" --ignore-not-found --timeout=300s >/dev/null || true
 }
 
+# The API server reserves a unique namespace even when two runs start together.
+RUN_NAME="$(kubectl create -f - -o jsonpath='{.metadata.name}' <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  generateName: scale-kwok-
+EOF
+)"
 if (( KEEP == 0 )); then
   trap cleanup EXIT
 fi
 
-log "creating ${NODES} nodes and $((NODES * PODS_PER_NODE)) workload pods"
+log "${RUN_NAME}: creating ${NODES} nodes and $((NODES * PODS_PER_NODE)) workload pods"
 create_nodes
 wait_for "${NODES} ready nodes" nodes_ready
 create_load
 wait_for "$((NODES * PODS_PER_NODE)) ready workload pods" load_ready
 sleep "${SETTLE}"
-record idle "$(memstats 1)" "$(rss_mib)"
+record_collected idle
 
 log "rolling out ${PACKAGES} package(s) to ${NODES} nodes"
 create_nodewright
 applied="${SECONDS}" peak_inuse=0 peak_sys=0 peak_rss=0 peak_stats="" deadline=$((SECONDS + TIMEOUT))
-until nodewright_complete; do
+while true; do
   if (( SECONDS > deadline )); then
     echo "timed out waiting for the NodeWright to complete" >&2
     exit 1
   fi
-  if (( SECONDS - applied > 120 )) && [[ -z "$(kubectl get nodewright "${NODEWRIGHT_NAME}" -o jsonpath='{.status.status}')" ]]; then
+  status="$(get nodewright "${RUN_NAME}" -o jsonpath='{.status.status}{" "}{.status.completeNodes}')" || { sleep 5; continue; }
+  [[ "${status}" == "complete ${NODES}/${NODES}" ]] && break
+  if (( SECONDS - applied > 120 )) && [[ -z "${status%% *}" ]]; then
     echo "the NodeWright has no status after 120s: check the operator log for a reconcile error" >&2
     exit 1
   fi
@@ -264,15 +295,20 @@ until nodewright_complete; do
   stats="$(memstats 0)" || { sleep 5; continue; }
   IFS=, read -r _ inuse sys <<<"${stats}"
   rss="$(rss_mib)"
-  if (( inuse > peak_inuse )); then
+  if [[ -z "${peak_stats}" ]] || (( inuse > peak_inuse )); then
     peak_inuse="${inuse}" peak_stats="${stats}"
   fi
   (( sys > peak_sys )) && peak_sys="${sys}"
   [[ -n "${rss}" ]] && (( rss > peak_rss )) && peak_rss="${rss}"
   sleep 5
 done
-IFS=, read -r peak_alloc _ _ <<<"${peak_stats:-0,0,0}"
-record rollout_peak "${peak_alloc},${peak_inuse},${peak_sys}" "$([[ -n "${PID}" ]] && echo "${peak_rss}")"
+if [[ -n "${peak_stats}" ]]; then
+  IFS=, read -r peak_alloc _ _ <<<"${peak_stats}"
+  record rollout_peak "${peak_alloc},${peak_inuse},${peak_sys}" "${PID:+${peak_rss}}"
+else
+  log "no successful rollout sample; leaving peak memory fields empty"
+  record rollout_peak ",," ""
+fi
 
 sleep "${SETTLE}"
-record complete "$(memstats 1)" "$(rss_mib)"
+record_collected complete
